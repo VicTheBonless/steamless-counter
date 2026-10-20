@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Steamless online counter</title>
+</head>
+<body>
+<script>
+/* Helper for the "gamers online" box.
+   It lives on a site that is allowed to talk to Firebase (like GitHub Pages),
+   counts the visitors and sends the number to the page that embeds it. */
+var DB = 'https://steamless-c61b3-default-rtdb.europe-west1.firebasedatabase.app';
+
+var STALE = 20000;        // forget a visitor after 20s of silence
+var EVERY = 5000;         // check in every 5s
+var leaving = false;
+
+var id;
+try {
+  id = sessionStorage.getItem('steamless_helper_id');
+  if (!id) { id = 'steamless_tab_' + Math.random().toString(36).slice(2); sessionStorage.setItem('steamless_helper_id', id); }
+} catch (e) { id = 'steamless_tab_' + Math.random().toString(36).slice(2); }
+
+function beat() {
+  if (leaving) return;
+  fetch(DB + '/presence/' + id + '.json', { method: 'PUT', body: JSON.stringify({ '.sv': 'timestamp' }) })
+    .then(function (r) { if (!r.ok) throw new Error('write failed: HTTP ' + r.status); return r.json(); })
+    .then(function (now) {
+      if (typeof now !== 'number') now = Date.now();
+      return fetch(DB + '/presence.json')
+        .then(function (r) { if (!r.ok) throw new Error('read failed: HTTP ' + r.status); return r.json(); })
+        .then(function (all) {
+          var c = 0; all = all || {};
+          Object.keys(all).forEach(function (k) {
+            if (typeof all[k] !== 'number') return;
+            if (now - all[k] < STALE) c++;
+            else fetch(DB + '/presence/' + k + '.json', { method: 'DELETE' }).catch(function () {});
+          });
+          parent.postMessage({ steamlessOnline: Math.max(1, c) }, '*');
+        });
+    })
+    .catch(function (err) { console.warn('Steamless counter:', err.message || err); });
+}
+
+function leave() {
+  leaving = true;
+  try { fetch(DB + '/presence/' + id + '.json', { method: 'DELETE', keepalive: true }); } catch (e) {}
+}
+
+window.addEventListener('pagehide', leave);
+window.addEventListener('beforeunload', leave);
+window.addEventListener('pageshow', function (e) { if (e.persisted) { leaving = false; beat(); } });
+beat();
+setInterval(beat, EVERY);
+</script>
+</body>
+</html>
