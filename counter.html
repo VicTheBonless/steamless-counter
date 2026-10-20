@@ -8,12 +8,12 @@
 <script>
 /* Helper for the "gamers online" box.
    It lives on a site that is allowed to talk to Firebase (like GitHub Pages),
-   counts the visitors and sends the number to the page that embeds it. */
+   keeps a live list of everyone on the site and sends the number to the page
+   that embeds it. Joins and leaves show up instantly. */
 var DB = 'https://steamless-c61b3-default-rtdb.europe-west1.firebasedatabase.app';
 
-var STALE = 20000;        // forget a visitor after 20s of silence
-var EVERY = 5000;         // check in every 5s
-var leaving = false;
+var STALE = 30000;        // a visitor who goes silent (crash, no internet) disappears after 30s
+var BEAT_EVERY = 10;      // "still here" signal every 10 seconds
 
 var id;
 try {
@@ -21,37 +21,100 @@ try {
   if (!id) { id = 'steamless_tab_' + Math.random().toString(36).slice(2); sessionStorage.setItem('steamless_helper_id', id); }
 } catch (e) { id = 'steamless_tab_' + Math.random().toString(36).slice(2); }
 
+var leaving = false;
+var offset = 0;           // server time minus this computer's time
+var ownTs = 0;            // my own last "still here" time (server time)
+var table = {};           // everyone online: id -> last "still here" time
+var last = -1;            // last number sent to the page
+var streamOK = false;     // live stream working?
+
+function serverNow() { return Date.now() + offset; }
+function post(c) { parent.postMessage({ steamlessOnline: c }, '*'); }
+
+function recount() {
+  if (ownTs && !(table[id] > ownTs)) table[id] = ownTs;
+  var now = serverNow(), c = 0;
+  Object.keys(table).forEach(function (k) {
+    if (typeof table[k] === 'number' && now - table[k] < STALE) c++;
+  });
+  c = Math.max(1, c);
+  if (c !== last) { last = c; post(c); }
+}
+
+/* "I'm still here" */
 function beat() {
   if (leaving) return;
   fetch(DB + '/presence/' + id + '.json', { method: 'PUT', body: JSON.stringify({ '.sv': 'timestamp' }) })
     .then(function (r) { if (!r.ok) throw new Error('write failed: HTTP ' + r.status); return r.json(); })
-    .then(function (now) {
-      if (typeof now !== 'number') now = Date.now();
-      return fetch(DB + '/presence.json')
-        .then(function (r) { if (!r.ok) throw new Error('read failed: HTTP ' + r.status); return r.json(); })
-        .then(function (all) {
-          var c = 0; all = all || {};
-          Object.keys(all).forEach(function (k) {
-            if (typeof all[k] !== 'number') return;
-            if (now - all[k] < STALE) c++;
-            else fetch(DB + '/presence/' + k + '.json', { method: 'DELETE' }).catch(function () {});
-          });
-          parent.postMessage({ steamlessOnline: Math.max(1, c) }, '*');
-        });
+    .then(function (ts) {
+      if (typeof ts === 'number') { offset = ts - Date.now(); ownTs = ts; } else { ownTs = serverNow(); }
+      table[id] = ownTs;
+      recount();
     })
     .catch(function (err) { console.warn('Steamless counter:', err.message || err); });
 }
+
+/* live stream: the database pushes every change to us */
+function apply(path, data, merge) {
+  if (path === '/') {
+    if (merge) {
+      Object.keys(data || {}).forEach(function (k) { if (data[k] === null) delete table[k]; else table[k] = data[k]; });
+    } else {
+      table = (data && typeof data === 'object') ? data : {};
+    }
+  } else {
+    var parts = path.split('/').filter(Boolean);
+    if (parts.length !== 1) return;
+    if (data === null) delete table[parts[0]]; else table[parts[0]] = data;
+  }
+  recount();
+}
+function connect() {
+  var es;
+  try { es = new EventSource(DB + '/presence.json'); } catch (e) { streamOK = false; return; }
+  es.addEventListener('put', function (e) { streamOK = true; try { var m = JSON.parse(e.data); apply(m.path, m.data, false); } catch (x) {} });
+  es.addEventListener('patch', function (e) { streamOK = true; try { var m = JSON.parse(e.data); apply(m.path, m.data, true); } catch (x) {} });
+  es.addEventListener('cancel', function () { streamOK = false; es.close(); setTimeout(connect, 5000); });
+  es.addEventListener('auth_revoked', function () { streamOK = false; es.close(); setTimeout(connect, 5000); });
+  es.onerror = function () { streamOK = false; if (es.readyState === 2) { setTimeout(connect, 5000); } };
+}
+
+/* backup: ask the database every 3 seconds if the live stream is not working */
+function poll() {
+  fetch(DB + '/presence.json')
+    .then(function (r) { if (!r.ok) throw new Error('read failed: HTTP ' + r.status); return r.json(); })
+    .then(function (all) { table = all || {}; recount(); })
+    .catch(function (err) { console.warn('Steamless counter:', err.message || err); });
+}
+
+/* one tick per second (a worker keeps ticking even when the tab is in the background) */
+var ticks = 0;
+function tick() {
+  ticks++;
+  recount();
+  if (ticks % BEAT_EVERY === 0) beat();
+  if (!streamOK && ticks % 3 === 0) poll();
+  if (ticks % 5 === 0) post(last < 0 ? 1 : last);
+}
+var timer = null;
+function startTimer() { if (!timer) timer = setInterval(tick, 1000); }
+try {
+  var w = new Worker(URL.createObjectURL(new Blob(['setInterval(function(){postMessage(0)},1000)'], { type: 'text/javascript' })));
+  w.onmessage = tick;
+  w.onerror = startTimer;
+} catch (e) { startTimer(); }
 
 function leave() {
   leaving = true;
   try { fetch(DB + '/presence/' + id + '.json', { method: 'DELETE', keepalive: true }); } catch (e) {}
 }
-
 window.addEventListener('pagehide', leave);
 window.addEventListener('beforeunload', leave);
 window.addEventListener('pageshow', function (e) { if (e.persisted) { leaving = false; beat(); } });
+document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') beat(); });
+
 beat();
-setInterval(beat, EVERY);
+connect();
 </script>
 </body>
 </html>
